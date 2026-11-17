@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b5fff">
+<link rel="manifest" href="manifest.json">
+<title>Ônibus Perto</title>
+<style>
+:root{--bg:#f4f6fa;--card:#fff;--fg:#14181f;--mut:#5b6573;--acc:#0b5fff;--ok:#12805c;--warn:#b25e00}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1116;--card:#171b22;--fg:#eef1f6;--mut:#9aa5b4;--acc:#6b9bff;--ok:#4cc9a0;--warn:#ffb454}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,sans-serif;padding:max(16px,env(safe-area-inset-top)) 16px 32px}
+main{max-width:480px;margin:auto;display:grid;gap:14px}
+h1{font-size:1.4rem;margin:4px 0}
+.card{background:var(--card);border-radius:14px;padding:14px;display:grid;gap:8px}
+.mut{color:var(--mut);font-size:.9rem}
+button,select,input{font:inherit}
+button{background:var(--acc);color:#fff;border:0;border-radius:10px;padding:12px 14px;font-weight:600}
+button.sec{background:transparent;color:var(--acc);border:1px solid var(--acc)}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+.bus{display:flex;justify-content:space-between;gap:8px;padding:8px 0;border-top:1px solid color-mix(in srgb,var(--mut) 25%,transparent)}
+.line{font-weight:700;font-size:1.1rem}
+.eta{font-variant-numeric:tabular-nums;font-weight:700}
+.ok{color:var(--ok)}.warn{color:var(--warn)}
+.tag{display:inline-block;background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn);border-radius:6px;padding:2px 8px;font-size:.8rem}
+</style>
+</head>
+<body>
+<main>
+<h1>Ônibus Perto</h1>
+<div class="card" id="start">
+  <div>Toque para ligar. O app usa sua localização e fala por voz.</div>
+  <button id="btnStart">Ligar</button>
+  <div class="mut">Mantenha esta tela aberta: o navegador não deixa o app rodar com a tela apagada.</div>
+</div>
+<div class="card" id="status" hidden>
+  <div id="stopName" class="line"></div>
+  <div id="stopInfo" class="mut"></div>
+  <div id="buses"></div>
+  <span class="tag" id="simTag">Horários simulados</span>
+</div>
+<div class="card" id="ask" hidden>
+  <div id="askText"></div>
+  <div class="row"><button id="yes">Sim, traçar rota</button><button class="sec" id="no">Não</button></div>
+</div>
+<div class="card">
+  <label for="snd" class="mut">Som do aviso (escolha um arquivo seu)</label>
+  <input id="snd" type="file" accept="audio/*">
+  <button class="sec" id="testSnd">Testar som</button>
+  <div id="msg" class="mut"></div>
+</div>
+</main>
+<script>
+// ===== Configuração =====
+const RAIO_BUSCA_M = 500;       // raio para procurar pontos
+const NO_PONTO_M = 25;          // abaixo disso você "já está no ponto": o app fica quieto
+const AVISA_ATE_MIN = 12;       // fala o ônibus se chegar em até X min
+const NOTIFICA_MIN = 3;         // notificação quando faltar X min
+const VEL_CAMINHADA = 1.3;      // m/s
+
+// ===== Fonte dos horários (TROCAR AQUI quando houver API real) =====
+// Contrato: getArrivals(stop) -> Promise<[{line, dest, etaMin, key}]>
+const provider = {
+  simulated: true,
+  async getArrivals(stop){
+    const now = Date.now()/60000;
+    const linhas = [["301","Centro",13],["412","Terminal",19],["P12","Circular",27]];
+    let h = 0; for (const c of String(stop.id)) h = (h*31 + c.charCodeAt(0)) >>> 0;
+    return linhas.map(([line,dest,p],i)=>{
+      const off = (h>>>i*3) % p;
+      const t = now + off;
+      const eta = p - (t % p);
+      return {line, dest, etaMin: eta, key: line+"|"+stop.id+"|"+Math.round((now+eta)/p)};
+    }).sort((a,b)=>a.etaMin-b.etaMin);
+  }
+};
+
+// ===== Utilidades =====
+const $ = id => document.getElementById(id);
+const rad = d => d*Math.PI/180;
+function dist(a,b,c,d){const R=6371000,dl=rad(c-a),dn=rad(d-b);
+  const x=Math.sin(dl/2)**2+Math.cos(rad(a))*Math.cos(rad(c))*Math.sin(dn/2)**2;
+  return 2*R*Math.asin(Math.sqrt(x));}
+function falar(t){try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.lang="pt-BR";speechSynthesis.speak(u);}catch(e){}}
+function msg(t){$("msg").textContent=t}
+let somUrl=null;
+try{somUrl=localStorage.getItem("som")}catch(e){}
+function tocar(){ if(!somUrl) return; try{new Audio(somUrl).play()}catch(e){} }
+$("snd").onchange=e=>{const f=e.target.files[0]; if(!f) return;
+  const r=new FileReader(); r.onload=()=>{somUrl=r.result; try{localStorage.setItem("som",somUrl)}catch(x){msg("Som muito grande para salvar; vale só nesta sessão.")} tocar();}; r.readAsDataURL(f);};
+$("testSnd").onclick=()=>{ if(somUrl) tocar(); else msg("Escolha um arquivo de som primeiro."); };
+
+// ===== Pontos de ônibus (OpenStreetMap / Overpass) =====
+let stops=[], stopsAt=null;
+async function carregaPontos(lat,lon){
+  const q=`[out:json][timeout:20];node(around:${RAIO_BUSCA_M},${lat},${lon})[highway=bus_stop];out;`;
+  const r=await fetch("https://overpass-api.de/api/interpreter",{method:"POST",body:"data="+encodeURIComponent(q)});
+  if(!r.ok) throw new Error("Overpass "+r.status);
+  const j=await r.json();
+  stops=j.elements.map(e=>({id:e.id,lat:e.lat,lon:e.lon,name:(e.tags&&(e.tags.name||e.tags.ref))||"Ponto sem nome"}));
+  stopsAt={lat,lon};
+}
+
+// ===== Lógica principal =====
+let pos=null, lastCheck=0, anunciado=new Set(), notificado=new Set(), perguntaAtual=null, ocupado=false;
+async function onPos(p){
+  pos={lat:p.coords.latitude,lon:p.coords.longitude};
+  if(ocupado||Date.now()-lastCheck<10000) return; ocupado=true; lastCheck=Date.now();
+  try{
+    if(!stopsAt||dist(pos.lat,pos.lon,stopsAt.lat,stopsAt.lon)>RAIO_BUSCA_M*0.5) await carregaPontos(pos.lat,pos.lon);
+    if(!stops.length){ $("status").hidden=false; $("stopName").textContent="Nenhum ponto por perto"; $("stopInfo").textContent="Sem pontos no mapa a "+RAIO_BUSCA_M+" m."; $("buses").innerHTML=""; return; }
+    const s=stops.map(x=>({...x,d:dist(pos.lat,pos.lon,x.lat,x.lon)})).sort((a,b)=>a.d-b.d)[0];
+    const buses=await provider.getArrivals(s);
+    const noPonto=s.d<=NO_PONTO_M;
+    const walkMin=s.d/VEL_CAMINHADA/60;
+    render(s,buses,noPonto,walkMin);
+    if(noPonto) return;                          // já está no ponto: não faz nada
+    const b=buses.find(x=>x.etaMin<=AVISA_ATE_MIN);
+    if(b&&!anunciado.has(b.key)){
+      anunciado.add(b.key);
+      const m=Math.max(1,Math.round(b.etaMin)), d=Math.round(s.d);
+      const alcanca=b.etaMin>=walkMin*0.9?"":" Talvez não dê tempo de chegar.";
+      const t=`Ônibus ${b.line} chega em ${m} minuto${m>1?"s":""} no ponto ${s.name}, a ${d} metros.${alcanca} Quer a rota até o ponto?`;
+      perguntaAtual=s; $("askText").textContent=t; $("ask").hidden=false; falar(t); ouveSimNao();
+    }
+    if(b&&b.etaMin<=NOTIFICA_MIN&&!notificado.has(b.key)){
+      notificado.add(b.key); tocar(); notifica(`Ônibus ${b.line} chegando`,`${Math.max(1,Math.round(b.etaMin))} min no ponto ${s.name}`);
+    }
+  }catch(e){ msg("Erro: "+e.message); }
+  finally{ ocupado=false; }
+}
+function render(s,buses,noPonto,walkMin){
+  $("status").hidden=false;
+  $("simTag").hidden=!provider.simulated;
+  $("stopName").textContent=s.name;
+  $("stopInfo").innerHTML=noPonto?'<span class="ok">Você está no ponto.</span>':`${Math.round(s.d)} m, cerca de ${Math.max(1,Math.round(walkMin))} min a pé`;
+  $("buses").innerHTML=buses.map(b=>`<div class="bus"><div><span class="line">${b.line}</span> <span class="mut">${b.dest}</span></div><div class="eta ${b.etaMin<=NOTIFICA_MIN?"warn":""}">${Math.max(1,Math.round(b.etaMin))} min</div></div>`).join("");
+}
+function tracaRota(){ if(!perguntaAtual) return;
+  const u=`https://www.google.com/maps/dir/?api=1&destination=${perguntaAtual.lat},${perguntaAtual.lon}&travelmode=walking`;
+  window.open(u,"_blank"); $("ask").hidden=true; }
+$("yes").onclick=tracaRota; $("no").onclick=()=>{$("ask").hidden=true};
+function ouveSimNao(){
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition; if(!SR) return;
+  setTimeout(()=>{ try{ const r=new SR(); r.lang="pt-BR"; r.onresult=e=>{const t=e.results[0][0].transcript.toLowerCase();
+      if(/\b(sim|quero|pode|claro)\b/.test(t)) tracaRota(); else if(/\b(não|nao)\b/.test(t)) $("ask").hidden=true;}; r.start(); }catch(e){} },4500);
+}
+async function notifica(t,c){
+  try{ if(Notification.permission!=="granted") return;
+    const reg=await navigator.serviceWorker.getRegistration();
+    if(reg) reg.showNotification(t,{body:c,vibrate:[200,100,200]}); else new Notification(t,{body:c}); }catch(e){}
+}
+
+// ===== Início =====
+$("btnStart").onclick=async()=>{
+  falar("Ônibus Perto ligado.");
+  try{ if("Notification" in window) await Notification.requestPermission(); }catch(e){}
+  try{ if("serviceWorker" in navigator) await navigator.serviceWorker.register("sw.js"); }catch(e){}
+  try{ if(navigator.wakeLock) await navigator.wakeLock.request("screen"); }catch(e){}
+  if(!navigator.geolocation){ msg("Este navegador não tem localização."); return; }
+  navigator.geolocation.watchPosition(onPos,e=>msg("Localização negada ou indisponível: "+e.message),{enableHighAccuracy:true,maximumAge:5000});
+  $("start").hidden=true; msg("Procurando sua localização...");
+};
+</script>
+</body>
+</html>
